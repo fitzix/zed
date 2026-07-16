@@ -2118,6 +2118,24 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
+fn should_handle_key_with_ime_first(
+    is_composing: bool,
+    is_ime_printable_key: bool,
+    keystroke: &Keystroke,
+) -> bool {
+    !keystroke.modifiers.alt
+        && (is_composing
+            || is_ime_printable_key
+            || (keystroke.key_char.is_none()
+                && !keystroke.modifiers.control
+                && !keystroke.modifiers.function
+                && !keystroke.modifiers.platform))
+}
+
+fn should_insert_held_key_without_ime(event: &KeyDownEvent) -> bool {
+    event.is_held && !event.keystroke.modifiers.alt && event.keystroke.key_char.is_some()
+}
+
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -2169,6 +2187,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             // and keys with function, as the input handler swallows them.
             // and keys with platform (Cmd), so that Cmd+key events (e.g. Cmd+`) are not
             // consumed by the IME on non-QWERTY / dead-key layouts.
+            // and keys with Alt (Option), so configured shortcuts are matched before the IME.
             // We also send printable keys to the IME first when an IME input source (e.g. Japanese,
             // Korean, Chinese) is active and the input handler accepts text input. This prevents
             // multi-stroke keybindings like `jj` from intercepting keys that the IME should compose
@@ -2189,13 +2208,11 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 })
                 .unwrap_or(false);
 
-            if is_composing
-                || is_ime_printable_key
-                || (key_down_event.keystroke.key_char.is_none()
-                    && !key_down_event.keystroke.modifiers.control
-                    && !key_down_event.keystroke.modifiers.function
-                    && !key_down_event.keystroke.modifiers.platform)
-            {
+            if should_handle_key_with_ime_first(
+                is_composing,
+                is_ime_printable_key,
+                &key_down_event.keystroke,
+            ) {
                 {
                     let mut lock = window_state.as_ref().lock();
                     lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
@@ -2223,7 +2240,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return YES;
             }
 
-            if key_down_event.is_held
+            if should_insert_held_key_without_ime(&key_down_event)
                 && let Some(key_char) = key_down_event.keystroke.key_char.as_ref()
             {
                 let handled = with_input_handler(this, |input_handler| {
@@ -3224,5 +3241,54 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    #[test]
+    fn option_modified_keys_do_not_go_to_ime_first() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            key: "d".into(),
+            key_char: Some("∂".into()),
+        };
+
+        for is_composing in [false, true] {
+            assert!(!should_handle_key_with_ime_first(
+                is_composing,
+                true,
+                &keystroke
+            ));
+        }
+    }
+
+    #[test]
+    fn unmodified_printable_keys_still_go_to_ime_first() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "j".into(),
+            key_char: Some("j".into()),
+        };
+
+        assert!(should_handle_key_with_ime_first(false, true, &keystroke));
+    }
+
+    #[test]
+    fn option_modified_repeats_are_not_inserted_without_the_ime() {
+        let event = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                key: "d".into(),
+                key_char: Some("∂".into()),
+            },
+            is_held: true,
+            prefer_character_input: false,
+        };
+
+        assert!(!should_insert_held_key_without_ime(&event));
     }
 }
