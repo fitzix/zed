@@ -1,8 +1,8 @@
 use crate::{
-    Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinition,
-    GoToDefinitionSplit, GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind,
-    HighlightKey, Navigated, PointForPosition, SelectPhase,
-    editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
+    Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinitionSplit,
+    GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind, HighlightKey, Navigated,
+    OpenResultsIn, PointForPosition, SelectPhase, editor_settings::GoToDefinitionFallback,
+    scroll::ScrollAmount,
 };
 use gpui::{
     App, AsyncWindowContext, Context, Entity, HighlightStyle, Modifiers, Pixels, Task,
@@ -202,23 +202,28 @@ impl Editor {
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
         cx.spawn_in(window, async move |editor, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
-            let find_references = editor
+            editor
                 .update_in(cx, |editor, window, cx| {
                     if definition_revealed == Navigated::Yes {
-                        return None;
+                        return;
                     }
-                    match EditorSettings::get_global(cx).go_to_definition_fallback {
-                        GoToDefinitionFallback::None => None,
-                        GoToDefinitionFallback::FindAllReferences => {
-                            editor.find_all_references(&FindAllReferences::default(), window, cx)
-                        }
+                    if EditorSettings::get_global(cx).go_to_definition_fallback
+                        == GoToDefinitionFallback::FindAllReferences
+                    {
+                        let focus_handle = editor.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            focus_handle.dispatch_action(
+                                &FindAllReferences {
+                                    open_results_in: Some(OpenResultsIn::Picker),
+                                    ..Default::default()
+                                },
+                                window,
+                                cx,
+                            );
+                        });
                     }
                 })
-                .ok()
-                .flatten();
-            if let Some(find_references) = find_references {
-                find_references.await.log_err();
-            }
+                .log_err();
         })
         .detach();
     }
@@ -320,7 +325,9 @@ impl Editor {
                 }
                 (true, false) => self.go_to_type_definition(&GoToTypeDefinition, window, cx),
                 (false, true) => self.go_to_definition_split(&GoToDefinitionSplit, window, cx),
-                (false, false) => self.go_to_definition(&GoToDefinition::default(), window, cx),
+                (false, false) => {
+                    self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, window, cx)
+                }
             }
         } else {
             Task::ready(Ok(Navigated::No))
@@ -1071,9 +1078,76 @@ mod tests {
     use settings::InlayHintSettingsContent;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use util::{assert_set_eq, path};
     use workspace::item::Item;
+
+    #[gpui::test]
+    async fn test_cmd_click_fallback_dispatches_references_picker(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                definition_provider: Some(lsp::OneOf::Left(true)),
+                references_provider: Some(lsp::OneOf::Left(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state("fn main() { let ˇvalue = 1; }");
+        cx.lsp
+            .set_request_handler::<GotoDefinition, _, _>(|_, _| async { Ok(None) });
+        cx.lsp
+            .set_request_handler::<lsp::request::References, _, _>(|_, _| async { Ok(None) });
+
+        let action_dispatched = Arc::new(AtomicBool::new(false));
+        let picker_requested = Arc::new(AtomicBool::new(false));
+        cx.update_editor(|editor, _, cx| {
+            let action_dispatched = action_dispatched.clone();
+            let picker_requested = picker_requested.clone();
+            editor
+                .register_action(move |action: &FindAllReferences, _, _| {
+                    action_dispatched.store(true, Ordering::SeqCst);
+                    picker_requested.store(
+                        action.open_results_in == Some(crate::OpenResultsIn::Picker),
+                        Ordering::SeqCst,
+                    );
+                })
+                .detach();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let click_position = cx.update_editor(|editor, _, cx| {
+            editor.hovered_link_state.take();
+            let snapshot = editor.display_snapshot(cx);
+            let point = editor
+                .selections
+                .newest::<MultiBufferOffset>(&snapshot)
+                .head()
+                .to_display_point(&snapshot);
+            PointForPosition {
+                previous_valid: point,
+                next_valid: point,
+                nearest_valid: point,
+                exact_unclipped: point,
+                column_overshoot_after_line_end: 0,
+            }
+        });
+        cx.update_editor(|editor, window, cx| {
+            editor.handle_click_hovered_link(click_position, Modifiers::default(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            action_dispatched.load(Ordering::SeqCst),
+            "Cmd+click fallback should dispatch FindAllReferences"
+        );
+        assert!(
+            picker_requested.load(Ordering::SeqCst),
+            "Cmd+click fallback should request the official references picker"
+        );
+    }
 
     #[test]
     fn test_document_link_target_to_hover_link_file_uri_with_fragment() {
